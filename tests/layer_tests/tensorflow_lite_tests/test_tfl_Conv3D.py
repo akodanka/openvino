@@ -41,4 +41,4 @@ class TestTFLiteConv3DLayerTest(TFLiteLayerTest):
     @pytest.mark.parametrize("params", test_params)
     @pytest.mark.nightly
     def test_conv3d(self, params, ie_device, precision, temp_dir):
-        self._test(ie_device, precision, temp_dir, {**params, 'custom_eps': 0.5})
+        self._test(ie_device, precision, temp_dir, params)
