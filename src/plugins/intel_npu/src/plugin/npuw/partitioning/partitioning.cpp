@@ -1397,6 +1397,17 @@ void Partitioner::saveTinyConstants(const std::string& func_name) {
 
     using CT = ov::op::v0::Constant;
 
+    // rt-info key set by frameworks (e.g. LiteRT) on Constants whose
+    // content is not shared with any other signature. NPUW's CWAI flow
+    // promotes large Constants to function Parameters so they can be
+    // looked up in the cross-signature shared bank; for non-shared
+    // Constants the promotion offers no sharing benefit and costs
+    // on-device kernel quality (the NPU compiler emits native quant
+    // kernels for Const→...→MatMul but not Param→...→MatMul). Keep them
+    // in-graph by adding them to consts_to_keep.
+    static constexpr const char* kNonSharedWeightKey =
+        "litert_ov_non_shared";
+
     for (auto&& op_node : model_group.front()->get_ordered_ops()) {
         for (auto&& iport : op_node->inputs()) {
             auto node = iport.get_source_output().get_node_shared_ptr();
@@ -1404,6 +1415,11 @@ void Partitioner::saveTinyConstants(const std::string& func_name) {
             if (ov::npuw::partitioning::traits::is_tiny_scalar(node)) {
                 LOG_DEBUG("[KEEP] " << node->get_friendly_name() << "/" << shape
                                     << ": It is safe to keep this bank in function");
+                func_group.consts_to_keep.insert(std::static_pointer_cast<CT>(node));
+            } else if (ov::op::util::is_constant(node) &&
+                       node->get_rt_info().count(kNonSharedWeightKey) > 0) {
+                LOG_DEBUG("[KEEP] " << node->get_friendly_name() << "/" << shape
+                                    << ": Marked as non-shared by frontend");
                 func_group.consts_to_keep.insert(std::static_pointer_cast<CT>(node));
             } else {
                 LOG_DEBUG("[CUT ] " << node->get_friendly_name() << "/" << shape
