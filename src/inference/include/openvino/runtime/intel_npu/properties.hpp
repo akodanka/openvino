@@ -10,6 +10,9 @@
  */
 #pragma once
 
+#include <cstddef>
+#include <memory>
+
 #include "openvino/runtime/properties.hpp"
 
 namespace ov {
@@ -214,6 +217,42 @@ static constexpr ov::Property<bool> disable_idle_memory_prunning{"NPU_DISABLE_ID
  * @ingroup ov_runtime_npu_prop_cpp_api
  */
 static constexpr ov::Property<std::string> enable_strides_for("NPU_ENABLE_STRIDES_FOR");
+
+/**
+ * @brief Namespace with NPUW-specific public properties.
+ */
+namespace npuw {
+
+/**
+ * @brief Describes an in-memory weights buffer handed to NPUW for weightless
+ * import.
+ *
+ * Use with the @ref weights_memory property when the caller already has the
+ * weights resident in memory and wants NPUW to read directly from that buffer
+ * — no filesystem path, no file descriptor, no extra copy. The @c holder
+ * keeps the underlying allocation alive for as long as NPUW is still reading
+ * from it; NPUW retains a copy of @c holder until the imported CompiledModel
+ * is destroyed.
+ * @ingroup ov_runtime_npu_prop_cpp_api
+ */
+struct WeightsMemory {
+    const void* data = nullptr;
+    std::size_t size = 0;
+    std::shared_ptr<void> holder;
+};
+
+/**
+ * @brief [Only for NPU Plugin, NPUW path]
+ * Type: ov::intel_npu::npuw::WeightsMemory
+ * Pass an already-resident in-memory weights buffer for weightless import.
+ * NPUW reads directly from the buffer; no filesystem path, no file
+ * descriptor, no extra copy beyond what the caller already pays.
+ * Mutually exclusive with WEIGHTS_PATH / NPUW_WEIGHTS_HANDLE_PROVIDER.
+ * @ingroup ov_runtime_npu_prop_cpp_api
+ */
+static constexpr ov::Property<WeightsMemory> weights_memory{"NPUW_WEIGHTS_MEMORY"};
+
+}  // namespace npuw
 
 }  // namespace intel_npu
 }  // namespace ov

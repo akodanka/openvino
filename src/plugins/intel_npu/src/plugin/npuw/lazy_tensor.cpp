@@ -79,6 +79,15 @@ ov::Tensor Const::eval() const {
         return ov::Tensor(m_cached_type, m_cached_shape, m_mmaped_weights->get_ptr(m_offset));
     }
 
+    // NPUW_WEIGHTS_MEMORY case: read_weight() already cached ctx.weights in
+    // m_mmaped_weights. Return a non-owning view at the requested offset;
+    // m_mmaped_weights keeps the underlying user-memory alive.
+    if (m_mmaped_weights) {
+        NPUW_ASSERT(!m_read_from_bin &&
+                    "Trying to read weight from weights buffer, but the weight has been already deserialized!");
+        return ov::Tensor(m_cached_type, m_cached_shape, m_mmaped_weights->get_ptr(m_offset));
+    }
+
     NPUW_ASSERT(m_read_from_bin && "Underlying data should have been read first! Or the tensor is already detached.");
     return m_read_from_bin;
 }
@@ -88,8 +97,8 @@ LazyTensor::Meta Const::eval_meta() const {
         return {m_node->get_shape(), m_node->get_element_type()};
     }
 
-    // Weightless import case
-    if (!m_weights_path.empty() || m_handle_provider) {
+    // Weightless import case (path / handle_provider / in-memory buffer).
+    if (!m_weights_path.empty() || m_handle_provider || m_mmaped_weights) {
         return {m_cached_shape, m_cached_type};
     }
 
@@ -119,16 +128,21 @@ void Const::read_weight(const ov::npuw::s11n::WeightsContext& ctx) {
             auto src_data = bf16_tensor.data<ov::bfloat16>();
             auto dst_data = m_read_from_bin.data<dst_type>();
             ov::reference::convert_from_bf16_to_f16_with_clamp(src_data, dst_data, m_read_from_bin.get_size());
-        } else {
+        } else if (!ctx.weights_path.empty() || ctx.handle_provider) {
             // Each LazyTensor will mmap the whole weights file on demand (in eval()).
             // It doesn't introduce extra allocation, however it allows to gradually 1 by 1
             // read mmaped CPU weights and allocate them on device without loading all the weights first.
             // Thus the memory consumption during import is greatly reduced but at the slight cost of performance.
-            NPUW_ASSERT(!ctx.weights_path.empty() || ctx.handle_provider);
             // Just save weights_path for the eval() to call the actual mmap.
             m_weights_path = ctx.weights_path;
             // Also save handle_provider if available
             m_handle_provider = ctx.handle_provider;
+        } else {
+            // NPUW_WEIGHTS_MEMORY case: ctx.weights already wraps a
+            // user-supplied in-memory buffer (no path, no fd). Keep a
+            // shared_ptr to it so eval() can return a view into the same
+            // buffer without remapping anything.
+            m_mmaped_weights = ctx.weights;
         }
     } else {
         auto it = ctx.consts_cache.find({m_offset, m_byte_size});

@@ -109,6 +109,36 @@ bool should_use_weightless_flow(const ov::AnyMap& non_npuw_props,
     return is_weightless;
 }
 
+// MappedMemory adapter that wraps an already-resident in-memory buffer
+// supplied via the NPUW_WEIGHTS_MEMORY property. Lets NPUW reuse the
+// existing SharedBuffer<MappedMemory>-based weightless plumbing without
+// touching the filesystem or copying bytes.
+class NoCopyMappedMemory : public ov::MappedMemory {
+public:
+    NoCopyMappedMemory(const void* data, std::size_t size, std::shared_ptr<void> holder)
+        : m_data(const_cast<char*>(static_cast<const char*>(data))),
+          m_size(size),
+          m_holder(std::move(holder)) {}
+
+    char* data() noexcept override {
+        return m_data;
+    }
+    std::size_t size() const noexcept override {
+        return m_size;
+    }
+    uint64_t get_id() const noexcept override {
+        return reinterpret_cast<uint64_t>(m_holder.get());
+    }
+    void hint_evict(std::size_t /*offset*/, std::size_t /*size*/) noexcept override {
+        // Bytes are user-resident, not page-cache backed — nothing to evict.
+    }
+
+private:
+    char* m_data = nullptr;
+    std::size_t m_size = 0;
+    std::shared_ptr<void> m_holder;
+};
+
 ov::npuw::s11n::WeightsContext make_import_weights_ctx(const ov::AnyMap& properties,
                                                        bool is_weightless,
                                                        const ov::npuw::s11n::BF16Cache& bf16_consts) {
@@ -117,7 +147,20 @@ ov::npuw::s11n::WeightsContext make_import_weights_ctx(const ov::AnyMap& propert
     std::string weights_path;
     WeightsContext::ConstsCache consts_cache;
     ov::FileHandleProvider handle_provider = nullptr;
+    ov::intel_npu::npuw::WeightsMemory weights_memory;
     if (is_weightless) {
+        if (const auto mem_it = properties.find(ov::intel_npu::npuw::weights_memory.name());
+            mem_it != properties.end()) {
+            if (mem_it->second.is<ov::intel_npu::npuw::WeightsMemory>()) {
+                weights_memory = mem_it->second.as<ov::intel_npu::npuw::WeightsMemory>();
+                NPUW_ASSERT(weights_memory.data && weights_memory.size > 0 &&
+                            "NPUW_WEIGHTS_MEMORY supplied an empty buffer");
+            } else {
+                LOG_WARN("NPUW_WEIGHTS_MEMORY property is present but is not a WeightsMemory; falling back to "
+                         "other weightless import sources");
+            }
+        }
+        if (!weights_memory.data) {
         if (const auto handle_it = properties.find(ov::intel_npu::npuw::weights_handle_provider.name());
             handle_it != properties.end()) {
             if (handle_it->second.is<ov::FileHandleProvider>()) {
@@ -154,14 +197,23 @@ ov::npuw::s11n::WeightsContext make_import_weights_ctx(const ov::AnyMap& propert
                 consts_cache[{offset, size}] = node;
             }
         } else if (!handle_provider) {
-            NPUW_ASSERT(false && "Blob is weightless but no WEIGHTS_PATH nor MODEL_PTR property is provided!");
+            NPUW_ASSERT(false && "Blob is weightless but no NPUW_WEIGHTS_MEMORY, NPUW_WEIGHTS_HANDLE_PROVIDER, "
+                                 "WEIGHTS_PATH nor MODEL_PTR property is provided!");
         }
+        }  // if (!weights_memory.data)
     }
 
     WeightsPtr weights = nullptr;
     if (is_weightless) {
         std::shared_ptr<ov::MappedMemory> mapped_memory;
-        if (handle_provider) {
+        if (weights_memory.data) {
+            // Wrap the caller-supplied buffer in a MappedMemory adapter — the
+            // adapter just forwards data()/size() and keeps holder alive. No
+            // mmap, no file I/O.
+            mapped_memory = std::make_shared<NoCopyMappedMemory>(weights_memory.data,
+                                                                 weights_memory.size,
+                                                                 weights_memory.holder);
+        } else if (handle_provider) {
             ov::FileHandle handle = handle_provider();
             mapped_memory = ov::load_mmap_object(handle);
         } else if (!weights_path.empty()) {
