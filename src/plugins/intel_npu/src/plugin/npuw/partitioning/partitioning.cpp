@@ -2802,6 +2802,16 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
                 p.saveTinyConstants(func_group);
                 p.saveScaleFactors(func_group);
                 p.createFunction(func_group);
+                // optimize() holds the NPUW_DQ gate (and the PMM / HostGather /
+                // ConvToMatmul head-tail passes), and it was only ever reached from
+                // run_fold_pipeline(). So NPUW_DQ=YES was SILENTLY INERT on the CWAI
+                // path: row G0 set the flag, no pass ran, and the null result was read
+                // as "DQ does not help CWAI". Gated on NPUW_DQ so the default (and
+                // everything LiteRT sets today) is bit-identical to before.
+                if (cfg.get<::intel_npu::NPUW_DQ>()) {
+                    LOG_INFO("CWAI: NPUW_DQ is set, running optimize() on " << func_group << "...");
+                    p.optimize(func_group);
+                }
                 p.decompressionCutOff(func_group);
             }
         };
