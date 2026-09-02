@@ -283,6 +283,18 @@ void ensure_hfa_selector(ov::npuw::v1::subgraphs::InferContext& ctx, RuntimeStat
     const size_t query_size = hfa->_sdpa_attention_info._query_size;
     state.hfa_selector = runtime::host_flash_attention::PositionIDs::find(query_size, request);
     if (!state.hfa_selector) {
+        // No position_ids Parameter. That is the normal case when a foreign host drives a plain
+        // CompiledModel: it does its own chunked prefill and neither exposes position_ids nor
+        // maintains history_size(). Fall back to reading the KV length out of the attention mask.
+        LOG_VERB("No position_ids found for HFA - falling back to the mask-derived KV length");
+        // Note: no mask index is passed. MaskLength reads the top-level request, so it locates the
+        // model's own mask input; _sdpa_indices.attention_mask is a function-body parameter index
+        // (used below to pick the tile loop's mask tensor out of io.inputs) and means nothing here.
+        state.hfa_selector = runtime::host_flash_attention::MaskLength::find(hfa->_tile_size,
+                                                                             hfa->_sdpa_attention_info._context_size,
+                                                                             request);
+    }
+    if (!state.hfa_selector) {
         OPENVINO_THROW("HFA dynamic capability is enabled, but no run-time features were found.");
     }
 }
