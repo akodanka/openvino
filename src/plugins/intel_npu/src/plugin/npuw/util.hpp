@@ -240,10 +240,42 @@ struct SDPAPatternNodes {
     std::vector<std::shared_ptr<ov::Node>> past_value_param_nodes;
     std::shared_ptr<ov::Node> past_key_concat_node = nullptr;
     std::shared_ptr<ov::Node> past_value_concat_node = nullptr;
+    // Set only when the attention block was matched in its *fused* form, i.e. as a single
+    // ov::op::v13::ScaledDotProductAttention rather than MatMul->Add->Softmax->MatMul. In that
+    // case matmul1/matmul2/softmax/add are all null and Q / mask / scale are read off the SDPA's
+    // own ports. Only produced when find_sdpa_pattern_nodes() is asked for it explicitly.
+    std::shared_ptr<ov::Node> fused_sdpa_node = nullptr;
+
+    bool is_fused() const {
+        return fused_sdpa_node != nullptr;
+    }
 
     bool is_valid() const {
-        return matmul1_node && matmul2_node && softmax_node && add_node && past_key_concat_node &&
-               past_value_concat_node;
+        const bool core = fused_sdpa_node || (matmul1_node && matmul2_node && softmax_node && add_node);
+        return core && past_key_concat_node && past_value_concat_node;
+    }
+
+    // Q source: input 0 of MatMul1 (decomposed) or input 0 of the SDPA (fused).
+    ov::Output<ov::Node> query_source() const {
+        return fused_sdpa_node ? fused_sdpa_node->input_value(0) : matmul1_node->input_value(0);
+    }
+
+    // Additive attention mask: input 1 of the Add (decomposed) or input 3 of the SDPA (fused).
+    // Returns an empty Output when the fused SDPA carries no mask (is_causal form).
+    ov::Output<ov::Node> mask_source() const {
+        if (fused_sdpa_node) {
+            return fused_sdpa_node->get_input_size() > 3 ? fused_sdpa_node->input_value(3) : ov::Output<ov::Node>{};
+        }
+        return add_node->input_value(1);
+    }
+
+    // Explicit attention scale. Only a fused SDPA carries one; in the decomposed form the scale
+    // has already been folded into Q by the producer, upstream of this block.
+    ov::Output<ov::Node> scale_source() const {
+        if (fused_sdpa_node && fused_sdpa_node->get_input_size() > 4) {
+            return fused_sdpa_node->input_value(4);
+        }
+        return {};
     }
 
     // Log pattern information for debugging. prefix is optional.
@@ -256,6 +288,7 @@ struct SDPAPatternNodes {
         LOG_DEBUG("  Key Concat: " << (past_key_concat_node ? past_key_concat_node->get_friendly_name() : "null"));
         LOG_DEBUG(
             "  Value Concat: " << (past_value_concat_node ? past_value_concat_node->get_friendly_name() : "null"));
+        LOG_DEBUG("  Fused SDPA: " << (fused_sdpa_node ? fused_sdpa_node->get_friendly_name() : "null"));
         LOG_DEBUG("  Past key params: " << past_key_param_nodes.size());
         LOG_DEBUG("  Past value params: " << past_value_param_nodes.size());
     }
@@ -263,12 +296,18 @@ struct SDPAPatternNodes {
 
 // Find the decomposed SDPA sub-graph pattern (MatMul->Add->Softmax->MatMul) in a
 // model and return all relevant nodes.  Returns an invalid result if not found.
-SDPAPatternNodes find_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model);
+// When allow_fused is set and no decomposed block is found, a lone fused
+// ov::op::v13::ScaledDotProductAttention is accepted instead (see SDPAPatternNodes::is_fused).
+// Callers that dereference matmul1/add/softmax/matmul2 directly must leave allow_fused false.
+SDPAPatternNodes find_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model, bool allow_fused = false);
 std::vector<SDPAPatternNodes> find_all_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model);
 
 // Traverse upward from an Add node's mask input to find the attention-mask
 // Parameter.  Only unary ops are traversed; returns nullptr on failure.
 std::shared_ptr<ov::op::v0::Parameter> find_mask_parameter(const std::shared_ptr<ov::Node>& add_node);
+
+// Same, but starting from an arbitrary output (e.g. the mask port of a fused SDPA).
+std::shared_ptr<ov::op::v0::Parameter> find_mask_parameter(const ov::Output<ov::Node>& mask_source);
 
 template <typename T>
 void fill_tensor(ov::SoPtr<ov::ITensor> tensor, T fill_val, size_t offset = 0u) {

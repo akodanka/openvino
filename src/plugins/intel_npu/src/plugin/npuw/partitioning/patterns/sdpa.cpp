@@ -12,6 +12,7 @@
 #include "openvino/op/ops.hpp"
 #include "openvino/pass/pattern/op/label.hpp"  // any_input
 #include "openvino/pass/pattern/op/optional.hpp"
+#include "openvino/pass/pattern/op/or.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
 #include "openvino/util/common_util.hpp"
 
@@ -107,10 +108,29 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
     auto opt_bcast_v = opp::optional<ov::op::v3::Broadcast>({opt_unsq_v->output(0), opp::any_input()});
     auto opt_rshp_v = opp::optional<ov::op::v1::Reshape>({opt_bcast_v->output(0), opp::any_input()});
 
+    // A layout-fixing Transpose may sit between the KV Concat and the SDPA. It appears when the
+    // cache is *stored* in a layout the SDPA cannot consume directly -- e.g. a V cache kept as
+    // [B,H,head_dim,seq], which the producing framework transposes to [B,H,seq,head_dim] on the
+    // way into the SDPA. Optional, so graphs without it keep matching unchanged.
+    auto opt_trans_k = opp::optional<ov::op::v1::Transpose>({opt_rshp_k->output(0), opp::any_input()});
+    auto opt_trans_v = opp::optional<ov::op::v1::Transpose>({opt_rshp_v->output(0), opp::any_input()});
+
     auto sdpa = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>(
-        {opp::any_input(), opt_rshp_k, opt_rshp_v, opp::any_input(), opp::any_input()});
-    auto trans = opp::wrap_type<ov::op::v1::Transpose>({sdpa, opp::any_input()});
-    auto reshape = opp::wrap_type<ov::op::v1::Reshape>({trans, opp::any_input()});
+        {opp::any_input(), opt_trans_k, opt_trans_v, opp::any_input(), opp::any_input()});
+
+    // Two orders of the post-SDPA reshaping chain are accepted:
+    //   (a) SDPA -> Transpose -> Reshape  -- the optimum/GenAI export;
+    //   (b) SDPA -> Reshape -> Transpose  -- emitted when Q folds each GQA group's query heads
+    //       into the query-sequence axis. Splitting that composite axis back apart can only be
+    //       done by a Reshape, so the Reshape is forced to come first. NPUW already matches
+    //       order (b) in make_sdpa_decomposed1_pattern() above.
+    auto trans_a = opp::wrap_type<ov::op::v1::Transpose>({sdpa, opp::any_input()});
+    auto reshape_a = opp::wrap_type<ov::op::v1::Reshape>({trans_a, opp::any_input()});
+
+    auto reshape_b = opp::wrap_type<ov::op::v1::Reshape>({sdpa, opp::any_input()});
+    auto trans_b = opp::wrap_type<ov::op::v1::Transpose>({reshape_b, opp::any_input()});
+
+    auto root = std::make_shared<opp::op::Or>(ov::OutputVector{reshape_a->output(0), trans_b->output(0)});
 
     auto node_to_gptr = snapshot->getNodeToGroupMap();
 
@@ -131,9 +151,13 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
                                                                     opt_unsq_v,
                                                                     opt_bcast_v,
                                                                     opt_rshp_v,
+                                                                    opt_trans_k,
+                                                                    opt_trans_v,
                                                                     sdpa,
-                                                                    trans,
-                                                                    reshape};
+                                                                    trans_a,
+                                                                    reshape_a,
+                                                                    reshape_b,
+                                                                    trans_b};
         for (auto&& pattern_node : pattern_nodes) {
             if (auto match_iter = node_to_output.find(pattern_node); match_iter != node_to_output.end()) {
                 auto matched_node = match_iter->second.get_node_shared_ptr();
@@ -144,7 +168,7 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
         }
         return false;  // root hasn't changed
     };
-    register_matcher(std::make_shared<opp::Matcher>(reshape, "TagSDPA"), std::move(callback));
+    register_matcher(std::make_shared<opp::Matcher>(root, "TagSDPA"), std::move(callback));
 }
 
 /*

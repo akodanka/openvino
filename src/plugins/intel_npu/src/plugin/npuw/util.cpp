@@ -24,6 +24,7 @@
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/softmax.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
@@ -1038,7 +1039,8 @@ std::optional<int> ov::npuw::util::isPresentKeyValuesValue(const std::string& st
 namespace {
 
 std::vector<ov::npuw::util::SDPAPatternNodes> find_sdpa_pattern_nodes_internal(const std::shared_ptr<ov::Model>& model,
-                                                                               bool findAll) {
+                                                                               bool findAll,
+                                                                               bool allow_fused = false) {
     // Find decomposed SDPA pattern components
     std::vector<ov::npuw::util::SDPAPatternNodes> pattern_nodes;
 
@@ -1152,6 +1154,32 @@ std::vector<ov::npuw::util::SDPAPatternNodes> find_sdpa_pattern_nodes_internal(c
         }
     }
 
+    // Fused fallback: some producers (e.g. the LiteRT OpenVINO compiler plugin) emit attention as a
+    // single v13::ScaledDotProductAttention and never decompose it, so the Softmax scan above finds
+    // nothing. Q / mask / scale then come off the SDPA's own ports; K and V are traced back to their
+    // Concats exactly as in the decomposed case.
+    if (allow_fused && pattern_nodes.empty()) {
+        LOG_DEBUG("No decomposed SDPA found - retrying in fused (v13::SDPA) form");
+        for (auto&& node : ops) {
+            if (!ov::is_type<ov::op::v13::ScaledDotProductAttention>(node))
+                continue;
+
+            ov::npuw::util::SDPAPatternNodes candidate;
+            candidate.fused_sdpa_node = node;
+            candidate.past_key_concat_node = find_concat_from_matmul(node, 1);
+            candidate.past_value_concat_node = find_concat_from_matmul(node, 2);
+            candidate.past_key_param_nodes = all_past_key_params;
+            candidate.past_value_param_nodes = all_past_value_params;
+
+            candidate.log_pattern(std::to_string(pattern_nodes.size()));
+
+            pattern_nodes.push_back(candidate);
+            if (!findAll) {
+                break;
+            }
+        }
+    }
+
     return pattern_nodes;
 }
 }  // namespace
@@ -1161,8 +1189,9 @@ std::vector<ov::npuw::util::SDPAPatternNodes> ov::npuw::util::find_all_sdpa_patt
     return find_sdpa_pattern_nodes_internal(model, true);
 }
 
-ov::npuw::util::SDPAPatternNodes ov::npuw::util::find_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model) {
-    auto internal_nodes = find_sdpa_pattern_nodes_internal(model, false);
+ov::npuw::util::SDPAPatternNodes ov::npuw::util::find_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model,
+                                                                         bool allow_fused) {
+    auto internal_nodes = find_sdpa_pattern_nodes_internal(model, false, allow_fused);
     if (internal_nodes.size() != 1) {
         return {};
     }
@@ -1174,8 +1203,12 @@ std::shared_ptr<ov::op::v0::Parameter> ov::npuw::util::find_mask_parameter(const
         return nullptr;
     }
     // Traverse the Add node's mask input (input 1) upwards to find the Parameter.
+    return find_mask_parameter(add_node->input(1).get_source_output());
+}
+
+std::shared_ptr<ov::op::v0::Parameter> ov::npuw::util::find_mask_parameter(const ov::Output<ov::Node>& mask_source) {
     // Only unary ops are allowed along the way.
-    auto mask_in_node = add_node->input(1).get_source_output().get_node_shared_ptr();
+    auto mask_in_node = mask_source.get_node_shared_ptr();
     while (mask_in_node && !ov::op::util::is_parameter(mask_in_node)) {
         if (mask_in_node->inputs().size() != 1) {
             LOG_WARN("Non-unary or disconnected op on the way from Add to input mask");
