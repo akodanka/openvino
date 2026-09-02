@@ -5,7 +5,9 @@
 #include "attn_subgraph.hpp"
 
 #include <array>
+#include <chrono>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -18,6 +20,7 @@
 #include "../logging.hpp"
 #include "../partitioning/partitioning.hpp"
 #include "../partitioning/patterns/sdpa.hpp"
+#include "../perf.hpp"
 #include "../pyramid_attention.hpp"
 #include "../serialization.hpp"
 
@@ -27,6 +30,96 @@ namespace attn {
 namespace {
 
 constexpr uint32_t ATTN_KV_DIM = 3;
+
+// ---------------------------------------------------------------------------
+// HFA tile-loop profiling. Enabled by OPENVINO_NPUW_PROF=YES (developer build only).
+//
+// Splits the per-tile cost into host prep (K/V binding, mask tiling) and the request
+// itself, so "the tile loop is slow" can be attributed rather than guessed. Tags are
+// keyed on tile size, which is what separates the layer families in one run: 128 =
+// sliding-window (local), 129 = global on Gemma-4 12B.
+//
+// NB: the regular-tile path keeps using infer() rather than start_async()+wait().
+// Splitting those would post the tile to the plugin's task executor instead of running
+// it on this thread, which both adds a hop and moves the driver-side input staging off
+// the timed region - i.e. it would change the thing being measured.
+// ---------------------------------------------------------------------------
+struct HFATileProfile {
+    using MS = ov::npuw::perf::metric<ov::npuw::perf::MSec>;
+    using B = ov::npuw::perf::counter<ov::npuw::perf::Bytes>;
+
+    ov::npuw::perf::Profile<MS> time;
+    ov::npuw::perf::Profile<B> copied;
+    std::mutex mutex;
+
+    HFATileProfile() {
+        const bool on = ov::npuw::profiling_enabled();
+        time.report_on_die = on;
+        time.area = "npuw/hfa/tile_loop";
+        copied.report_on_die = on;
+        copied.area = "npuw/hfa/tile_loop (host copies)";
+    }
+
+    void add_time(const std::string& tag, float ms) {
+        std::lock_guard<std::mutex> guard(mutex);
+        time[tag] += std::move(ms);
+    }
+
+    void add_bytes(const std::string& tag, uint64_t bytes) {
+        std::lock_guard<std::mutex> guard(mutex);
+        copied[tag] += std::move(bytes);
+    }
+};
+
+HFATileProfile& hfa_profile() {
+    static HFATileProfile profile;
+    return profile;
+}
+
+// Tag metrics by tile size so the local (128) and global (129) families stay apart.
+std::string hfa_tag(int64_t tile_size, const char* what) {
+    return "tile" + std::to_string(tile_size) + "." + what;
+}
+
+// Scoped timer. RAII rather than a lambda-wrapping helper on purpose: the tile loop lives
+// inside a generic lambda, and MSVC cannot capture enclosing locals in a lambda nested there.
+class HFAScopedTimer {
+public:
+    HFAScopedTimer(int64_t tile_size, const char* what)
+        : m_enabled(ov::npuw::profiling_enabled()),
+          m_tile_size(tile_size),
+          m_what(what) {
+        if (m_enabled) {
+            m_start = std::chrono::steady_clock::now();
+        }
+    }
+
+    ~HFAScopedTimer() {
+        if (!m_enabled) {
+            return;
+        }
+        const auto end = std::chrono::steady_clock::now();
+        const float ms =
+            std::chrono::duration_cast<std::chrono::microseconds>(end - m_start).count() / 1000.0f;
+        hfa_profile().add_time(hfa_tag(m_tile_size, m_what), ms);
+    }
+
+    HFAScopedTimer(const HFAScopedTimer&) = delete;
+    HFAScopedTimer& operator=(const HFAScopedTimer&) = delete;
+
+private:
+    const bool m_enabled;
+    const int64_t m_tile_size;
+    const char* const m_what;
+    std::chrono::steady_clock::time_point m_start;
+};
+
+void hfa_count_bytes(int64_t tile_size, const char* what, uint64_t bytes) {
+    if (!ov::npuw::profiling_enabled()) {
+        return;
+    }
+    hfa_profile().add_bytes(hfa_tag(tile_size, what), bytes);
+}
 
 struct BehaviorIO {
     std::vector<ov::SoPtr<ov::ITensor>> inputs;
@@ -963,6 +1056,11 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                                 int64_t tile_length,
                                                 bool async = false,
                                                 bool process_with_mask = true) {
+                            // Regular and final tiles run different models on different requests -
+                            // keep their prep costs apart, there is one final tile per N regular ones.
+                            const char* const kv_tag = async ? "final.prep_kv" : "reg.prep_kv";
+                            const char* const mask_tag = async ? "final.prep_mask" : "reg.prep_mask";
+
                             auto k_tile_buffer = request->get_tensor(model->inputs()[tile_in.k]);
                             auto v_tile_buffer = request->get_tensor(model->inputs()[tile_in.v]);
                             ov::SoPtr<ov::ITensor> mask_tile_buffer;
@@ -970,33 +1068,51 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                 mask_tile_buffer = request->get_tensor(model->inputs()[tile_in.mask]);
                             }
 
-                            if (can_reuse_tensor_zero_copy(k_source,
-                                                           k_tile_buffer,
-                                                           K_SEQ_DIM,
-                                                           kv_offset,
-                                                           tile_length)) {
-                                request->set_tensor(model->inputs()[tile_in.k], k_source);
-                            } else if (hfa_desc->_can_use_tensor_view) {
-                                request->set_tensor(model->inputs()[tile_in.k],
-                                                    ov::npuw::util::view(k_source, K_SEQ_DIM, kv_offset, tile_length));
-                            } else {
-                                extract_and_copy_tile(k_source, k_tile_buffer, K_SEQ_DIM, kv_offset, tile_length, "K");
-                            }
+                            {
+                                HFAScopedTimer timer(tile_size, kv_tag);
+                                if (can_reuse_tensor_zero_copy(k_source,
+                                                               k_tile_buffer,
+                                                               K_SEQ_DIM,
+                                                               kv_offset,
+                                                               tile_length)) {
+                                    request->set_tensor(model->inputs()[tile_in.k], k_source);
+                                } else if (hfa_desc->_can_use_tensor_view) {
+                                    request->set_tensor(
+                                        model->inputs()[tile_in.k],
+                                        ov::npuw::util::view(k_source, K_SEQ_DIM, kv_offset, tile_length));
+                                } else {
+                                    extract_and_copy_tile(k_source,
+                                                          k_tile_buffer,
+                                                          K_SEQ_DIM,
+                                                          kv_offset,
+                                                          tile_length,
+                                                          "K");
+                                    hfa_count_bytes(tile_size, "kv_copied", k_tile_buffer->get_byte_size());
+                                }
 
-                            if (can_reuse_tensor_zero_copy(v_source,
-                                                           v_tile_buffer,
-                                                           V_SEQ_DIM,
-                                                           kv_offset,
-                                                           tile_length)) {
-                                request->set_tensor(model->inputs()[tile_in.v], v_source);
-                            } else if (hfa_desc->_can_use_tensor_view) {
-                                request->set_tensor(model->inputs()[tile_in.v],
-                                                    ov::npuw::util::view(v_source, V_SEQ_DIM, kv_offset, tile_length));
-                            } else {
-                                extract_and_copy_tile(v_source, v_tile_buffer, V_SEQ_DIM, kv_offset, tile_length, "V");
+                                if (can_reuse_tensor_zero_copy(v_source,
+                                                               v_tile_buffer,
+                                                               V_SEQ_DIM,
+                                                               kv_offset,
+                                                               tile_length)) {
+                                    request->set_tensor(model->inputs()[tile_in.v], v_source);
+                                } else if (hfa_desc->_can_use_tensor_view) {
+                                    request->set_tensor(
+                                        model->inputs()[tile_in.v],
+                                        ov::npuw::util::view(v_source, V_SEQ_DIM, kv_offset, tile_length));
+                                } else {
+                                    extract_and_copy_tile(v_source,
+                                                          v_tile_buffer,
+                                                          V_SEQ_DIM,
+                                                          kv_offset,
+                                                          tile_length,
+                                                          "V");
+                                    hfa_count_bytes(tile_size, "kv_copied", v_tile_buffer->get_byte_size());
+                                }
                             }
 
                             if (process_with_mask && attention_mask_tensor) {
+                                HFAScopedTimer timer(tile_size, mask_tag);
                                 if (can_reuse_tensor_zero_copy(attention_mask_tensor,
                                                                mask_tile_buffer,
                                                                MASK_KV_SEQ_DIM,
@@ -1019,6 +1135,7 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                                               mask_offset,
                                                               tile_length,
                                                               "Mask");
+                                        hfa_count_bytes(tile_size, "mask_copied", cached_mask_tile->get_byte_size());
                                         state.hfa_runtime_ctx->cache_mask_tile(attention_mask_tensor,
                                                                                mask_offset,
                                                                                tile_length,
@@ -1033,16 +1150,25 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                                           mask_offset,
                                                           tile_length,
                                                           "Mask");
+                                    hfa_count_bytes(tile_size, "mask_copied", mask_tile_buffer->get_byte_size());
                                 }
                             }
 
                             if (async) {
-                                request->start_async();
+                                {
+                                    HFAScopedTimer timer(tile_size, "final.submit");
+                                    request->start_async();
+                                }
                                 if (state.hfa_runtime_ctx && state.hfa_runtime_ctx->has_state_buffers()) {
+                                    HFAScopedTimer timer(tile_size, "final.prep_state");
                                     state.hfa_runtime_ctx->prepare_next_state_buffers();
                                 }
-                                request->wait();
+                                {
+                                    HFAScopedTimer timer(tile_size, "final.wait");
+                                    request->wait();
+                                }
                             } else {
+                                HFAScopedTimer timer(tile_size, "reg.exec");
                                 request->infer();
                             }
                         };
