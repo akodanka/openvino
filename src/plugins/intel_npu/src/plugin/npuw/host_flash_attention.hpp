@@ -311,17 +311,20 @@ struct HFARuntimeContext {
         const auto mask_shape = mask_port.get_shape();
         const auto mask_dtype = mask_port.get_element_type();
 
-        // Calculate maximum number of tiles based on context size
+        // Calculate maximum number of tiles based on context size.
+        // Note this is keyed on the *tile* size, not the query size: when the producer folds the GQA
+        // group into Q's query-sequence axis the two differ, and query_size need not divide the
+        // context at all (16512 % 2048 != 0), which used to truncate this grid silently.
         const size_t context_size = hfa_desc._sdpa_attention_info._context_size;
-        const size_t query_size = hfa_desc._sdpa_attention_info._query_size;
+        const size_t tile_size = hfa_desc._tile_size;
 
         // Validate configuration
-        if (context_size % query_size != 0) {
+        if (tile_size == 0 || context_size % tile_size != 0) {
             throw std::runtime_error("HFA: context_size (" + std::to_string(context_size) +
-                                     ") must be divisible by query_size (" + std::to_string(query_size) + ")");
+                                     ") must be divisible by tile_size (" + std::to_string(tile_size) + ")");
         }
 
-        const size_t max_num_tiles = context_size / query_size;
+        const size_t max_num_tiles = context_size / tile_size;
 
         // Allocate temporary buffers for mask tile extraction
         m_mask_tile_buffers.clear();

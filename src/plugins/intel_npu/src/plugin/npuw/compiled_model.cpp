@@ -603,6 +603,26 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                                        " dropped, causing inference failures.  Ensure all shared-KV"
                                        " fan-outs are resolved before HFA is applied.");
                     }
+                    // Same reasoning for the shapes.  The tile model's Result becomes the funcall
+                    // result every consuming subgraph reads, so a mismatch here does not surface
+                    // until set_tensor throws deep inside the first inference, pointing at the
+                    // consumer rather than at HFA.
+                    for (size_t out = 0; out < tile_outs; out++) {
+                        const auto& proto_shape = fcn_template._model->get_results()[out]->get_output_partial_shape(0);
+                        const auto& tile_shape = hfa._final_tile_model->outputs()[out].get_partial_shape();
+                        if (proto_shape != tile_shape) {
+                            OPENVINO_THROW("NPUW HFA: subgraph[",
+                                           id,
+                                           "] output ",
+                                           out,
+                                           " is ",
+                                           proto_shape,
+                                           " in the prototype model but ",
+                                           tile_shape,
+                                           " in the HFA tile model.  The tile model must reproduce the"
+                                           " attention block's own output layout.");
+                        }
+                    }
                     m_compiled_submodels[id].model = hfa._final_tile_model;
                 } else {
                     m_compiled_submodels[id].model = fcn_template._model;

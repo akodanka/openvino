@@ -471,6 +471,94 @@ static std::shared_ptr<ov::Node> reshape_q_for_groups(const std::shared_ptr<ov::
 #endif  // ENABLE_HFA_LOOP_BASED_COMPUTATION
 
 // ============================================================================
+// Helper: the layout chain between the attention output and the block's Result
+// ============================================================================
+// The tile models compute the attention output in the SDPA's own [B,H,S,D] layout, but what the
+// block has to hand back is whatever its Result carries. GenAI's decomposed blocks end in
+// Transpose(0,2,1,3) -> Reshape([B,S,H*D]), which is exactly the pair create_final_tile_outputs
+// hardcodes. LiteRT's fused blocks do not: Q folds each GQA group's query heads into the query
+// axis, so the block ends in Reshape([B,H*G,q,D]) -> Transpose(0,2,1,3) = [B,q,H*G,D], and the
+// head-flattening Reshape sits *outside* the block, feeding the O projection.
+//
+// Emitting the hardcoded pair there builds a final tile model whose Result is a different shape
+// from the funcall result the consuming subgraph reads, and nothing checks it until the first
+// inference does set_tensor and throws "The input tensor size is not equal to the model input
+// type". So read the block's real chain and clone it into the tile model instead.
+//
+// Only pure layout ops are accepted, and only as a single unforked chain: anything else means the
+// caller cannot reproduce the block and should say so rather than guess.
+struct PostAttentionChain {
+    std::vector<std::shared_ptr<ov::Node>> nodes;  // attention-output side first
+    ov::Shape result_shape;
+    bool found_result = false;
+};
+
+static PostAttentionChain collect_post_attention_chain(const std::shared_ptr<ov::Node>& attn_out) {
+    PostAttentionChain chain;
+    if (!attn_out || attn_out->get_output_size() != 1) {
+        LOG_DEBUG("Post-attention chain: no single-output attention node to start from");
+        return chain;
+    }
+    ov::Output<ov::Node> cur = attn_out->output(0);
+    LOG_DEBUG("Post-attention chain: walking down from " << attn_out->get_type_name() << " '"
+                                                         << attn_out->get_friendly_name() << "' "
+                                                         << cur.get_partial_shape());
+    LOG_BLOCK();
+    while (true) {
+        const auto consumers = cur.get_target_inputs();
+        if (consumers.size() != 1) {
+            LOG_DEBUG("stop: output has " << consumers.size() << " consumers, not 1 - not a chain");
+            return PostAttentionChain{};
+        }
+        const auto& consumer = *consumers.begin();
+        auto next = consumer.get_node()->shared_from_this();
+        LOG_DEBUG("-> " << next->get_type_name() << " '" << next->get_friendly_name() << "' (port "
+                        << consumer.get_index() << ") " << next->get_output_partial_shape(0));
+        if (ov::is_type<ov::op::v0::Result>(next)) {
+            if (cur.get_partial_shape().is_dynamic()) {
+                LOG_DEBUG("stop: the block's Result is dynamic");
+                return PostAttentionChain{};
+            }
+            chain.result_shape = cur.get_shape();
+            chain.found_result = true;
+            return chain;
+        }
+        // A Convert is walked through but never cloned. The one that shows up here is NPUW's own
+        // f16 interconnect cast on the block boundary, and the tile model already ends in
+        // Convert(..., output_dtype) with output_dtype read off this very Result - cloning it would
+        // just duplicate that. Layout ops carry no arithmetic, so moving the cast to the end of the
+        // chain is numerically the same thing.
+        const bool is_cast = ov::is_type<ov::op::v0::Convert>(next);
+        const bool is_layout_op =
+            ov::is_type<ov::op::v1::Reshape>(next) || ov::is_type<ov::op::v1::Transpose>(next) ||
+            ov::is_type<ov::op::v0::Squeeze>(next) || ov::is_type<ov::op::v0::Unsqueeze>(next);
+        if (!is_layout_op && !is_cast) {
+            LOG_DEBUG("stop: " << next->get_type_name() << " is not a pure layout op");
+            return PostAttentionChain{};
+        }
+        if (consumer.get_index() != 0 || next->get_output_size() != 1) {
+            LOG_DEBUG("stop: consumed on port " << consumer.get_index() << " / " << next->get_output_size()
+                                                << " outputs");
+            return PostAttentionChain{};
+        }
+        // Everything but the data port must be a Constant, so the node can be cloned into a model
+        // that has no other connection to this graph.
+        for (std::size_t i = 1; i < next->get_input_size(); ++i) {
+            const auto arg = next->get_input_node_shared_ptr(i);
+            if (!ov::is_type<ov::op::v0::Constant>(arg)) {
+                LOG_DEBUG("stop: input " << i << " is " << arg->get_type_name() << " '" << arg->get_friendly_name()
+                                         << "', not a Constant - cannot be cloned into the tile model");
+                return PostAttentionChain{};
+            }
+        }
+        if (!is_cast) {
+            chain.nodes.push_back(next);
+        }
+        cur = next->output(0);
+    }
+}
+
+// ============================================================================
 // Helper function: Create final tile model outputs (division, transpose, reshape)
 // ============================================================================
 static ov::ResultVector create_final_tile_outputs(const FlashAttentionResults& results,
@@ -479,7 +567,8 @@ static ov::ResultVector create_final_tile_outputs(const FlashAttentionResults& r
                                                   size_t seq_len,
                                                   size_t num_heads,
                                                   size_t head_dim,
-                                                  bool fused_flash_attention = false) {
+                                                  bool fused_flash_attention = false,
+                                                  const std::vector<std::shared_ptr<ov::Node>>& post_attn_chain = {}) {
     std::shared_ptr<ov::Node> final_result;
     if (fused_flash_attention) {
         // If using FlashAttentionTile node, the output is already normalized, so skip division
@@ -492,20 +581,36 @@ static ov::ResultVector create_final_tile_outputs(const FlashAttentionResults& r
             std::make_shared<ov::op::v1::Divide>(results.acc.get_node_shared_ptr(), results.d.get_node_shared_ptr());
         final_result->set_friendly_name("final_result");
     }
-    // Transpose (0,2,1,3): [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]
-    auto transpose_order =
-        std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{4}, std::vector<int64_t>{0, 2, 1, 3});
-    auto transposed_result = std::make_shared<ov::op::v1::Transpose>(final_result, transpose_order);
-    transposed_result->set_friendly_name("transposed_result");
+    std::shared_ptr<ov::Node> reshaped_result;
+    if (!post_attn_chain.empty()) {
+        // Replay the block's own layout chain. final_result is in the SDPA's output layout
+        // [batch, num_heads, seq_len, head_dim], which is what the first node of the chain saw.
+        std::shared_ptr<ov::Node> cur = final_result;
+        for (const auto& node : post_attn_chain) {
+            ov::OutputVector new_inputs{cur->output(0)};
+            for (std::size_t i = 1; i < node->get_input_size(); ++i) {
+                new_inputs.push_back(node->get_input_node_shared_ptr(i)->clone_with_new_inputs({})->output(0));
+            }
+            cur = node->clone_with_new_inputs(new_inputs);
+            cur->set_friendly_name("post_attn_" + node->get_friendly_name());
+        }
+        reshaped_result = cur;
+    } else {
+        // Transpose (0,2,1,3): [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]
+        auto transpose_order =
+            std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{4}, std::vector<int64_t>{0, 2, 1, 3});
+        auto transposed_result = std::make_shared<ov::op::v1::Transpose>(final_result, transpose_order);
+        transposed_result->set_friendly_name("transposed_result");
 
-    // Reshape: [batch, seq_len, num_heads, head_dim] -> [batch, seq_len, num_heads*head_dim]
-    auto reshape_pattern =
-        std::make_shared<ov::op::v0::Constant>(ov::element::i64,
-                                               ov::Shape{3},
-                                               std::vector<int64_t>{static_cast<int64_t>(batch),
-                                                                    static_cast<int64_t>(seq_len),
-                                                                    static_cast<int64_t>(num_heads * head_dim)});
-    auto reshaped_result = std::make_shared<ov::op::v1::Reshape>(transposed_result, reshape_pattern, false);
+        // Reshape: [batch, seq_len, num_heads, head_dim] -> [batch, seq_len, num_heads*head_dim]
+        auto reshape_pattern =
+            std::make_shared<ov::op::v0::Constant>(ov::element::i64,
+                                                   ov::Shape{3},
+                                                   std::vector<int64_t>{static_cast<int64_t>(batch),
+                                                                        static_cast<int64_t>(seq_len),
+                                                                        static_cast<int64_t>(num_heads * head_dim)});
+        reshaped_result = std::make_shared<ov::op::v1::Reshape>(transposed_result, reshape_pattern, false);
+    }
     reshaped_result->set_friendly_name("reshaped_result");
 
     // Convert final output to original SDPA output dtype
@@ -602,7 +707,9 @@ static std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape
                                                         bool fused_flash_attention = false,
                                                         bool enable_mask_skipping = false,
                                                         bool v_transposed = true,
-                                                        const ov::element::Type& output_dtype = ov::element::f16) {
+                                                        const ov::element::Type& output_dtype = ov::element::f16,
+                                                        const std::shared_ptr<ov::op::v0::Constant>& q_scale = nullptr,
+                                                        const std::vector<std::shared_ptr<ov::Node>>& post_attn_chain = {}) {
     LOG_DEBUG("Creating HFA " << (is_final_tile ? "FINAL " : "") << "tile model with tile_size=" << tile_size
                               << ", kv_num_heads=" << kv_num_heads << ", mask_dtype=" << mask_dtype
                               << (is_final_tile ? ", output_dtype=" + output_dtype.get_type_name() : "")
@@ -629,6 +736,24 @@ static std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape
     // For the non-fused operation all tiles require mask
     const bool use_mask = is_final_tile || !fused_flash_attention || !enable_mask_skipping;
     auto f32_nodes = convert_inputs_to_f32(inputs, mask_dtype, compute_dtype, use_mask);
+
+    // The tile models compute raw Q*K^T -- they carry no attention scale of their own, so they
+    // assume Q arrives pre-scaled. That holds when the block was extracted in its decomposed form
+    // (the producer's Multiply(q, scale) sits upstream of the block boundary), but NOT when it was
+    // extracted from a fused SDPA, whose scale lives on the op's own port and would otherwise be
+    // dropped. Re-apply it here. Nothing is inserted when q_scale is null, so decomposed-form
+    // graphs build exactly the same tile models as before.
+    if (q_scale) {
+        std::shared_ptr<ov::Node> scale_f32 = q_scale;
+        if (q_scale->get_output_element_type(0) != compute_dtype) {
+            scale_f32 = std::make_shared<ov::op::v0::Convert>(q_scale, compute_dtype);
+            scale_f32->set_friendly_name("q_scale_f32");
+        }
+        auto q_scaled = std::make_shared<ov::op::v1::Multiply>(f32_nodes.q_f32, scale_f32);
+        q_scaled->set_friendly_name("q_f32_scaled");
+        f32_nodes.q_f32 = q_scaled;
+        LOG_DEBUG("Applying explicit attention scale inside the HFA tile model");
+    }
 
     FlashAttentionResults results;
 
@@ -705,7 +830,8 @@ static std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape
                                                   seq_len,
                                                   num_heads,
                                                   head_dim,
-                                                  fused_flash_attention);
+                                                  fused_flash_attention,
+                                                  post_attn_chain);
         model_name = "HFA_Final_Tile";
         LOG_DEBUG("HFA FINAL tile model created: inputs=" << input_dtype << ", compute=" << compute_dtype
                                                           << ", output=" << output_dtype);
@@ -763,9 +889,11 @@ static void build_sdpa_param_mapping(HostFlashAttention& hfa,
         return ov::as_type_ptr<ov::op::v0::Parameter>(skip_convert_nodes(node));
     };
 
-    // Extract Q (query) parameter - input 0 of MatMul1
-    if (auto q_param = extract_param(pattern_nodes.matmul1_node->get_input_node_shared_ptr(0))) {
+    // Extract Q (query) parameter - input 0 of MatMul1 (decomposed) or of the SDPA (fused)
+    if (auto q_param = extract_param(pattern_nodes.query_source().get_node_shared_ptr())) {
         hfa._query_param_idx = model->get_parameter_index(q_param);
+    } else {
+        LOG_WARN("Q input is not a Parameter of this block - HFA would bind the wrong tensor");
     }
 
     // Extract past KV parameters from a Concat node: all inputs except the last are treated as
@@ -804,8 +932,8 @@ static void build_sdpa_param_mapping(HostFlashAttention& hfa,
                       hfa._present_value_param_idx,
                       "past_value");
 
-    // Extract mask parameter - input 1 of add_node
-    if (auto add_param = extract_param(pattern_nodes.add_node->get_input_node_shared_ptr(1))) {
+    // Extract mask parameter - input 1 of add_node (decomposed) or input 3 of the SDPA (fused)
+    if (auto add_param = extract_param(pattern_nodes.mask_source().get_node_shared_ptr())) {
         hfa._attention_mask_param_idx = model->get_parameter_index(add_param);
     }
 
@@ -949,13 +1077,14 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     // ========================================================================
     // Step 1: Validate SDPA pattern and extract key nodes
     // ========================================================================
-    auto pattern_nodes = ov::npuw::util::find_sdpa_pattern_nodes(model);
+    auto pattern_nodes = ov::npuw::util::find_sdpa_pattern_nodes(model, /*allow_fused=*/true);
     if (!pattern_nodes.is_valid()) {
         LOG_WARN("Failed to re-find SDPA pattern nodes");
         return std::nullopt;
     }
+    LOG_DEBUG("Matched attention block in " << (pattern_nodes.is_fused() ? "fused" : "decomposed") << " form");
 
-    auto q_input = pattern_nodes.matmul1_node->get_input_node_shared_ptr(0);
+    auto q_input = pattern_nodes.query_source().get_node_shared_ptr();
     auto k_concat = pattern_nodes.past_key_concat_node;
 
     // Skip Convert nodes to get to the actual Parameter/input
@@ -986,12 +1115,28 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     std::size_t query_size = q_shape_static[2];  // seq_len at index 2
     LOG_DEBUG("Extracted query_size (seq_len) from Q shape: " << query_size);
 
-    auto mask_param = ov::npuw::util::find_mask_parameter(pattern_nodes.add_node);
+    auto mask_source = pattern_nodes.mask_source();
+    if (!mask_source.get_node_shared_ptr()) {
+        LOG_WARN("Attention block carries no additive mask - not supported by HFA");
+        return std::nullopt;
+    }
+    auto mask_param = ov::npuw::util::find_mask_parameter(mask_source);
     if (!mask_param) {
         LOG_WARN("Could not find mask parameter in model");
         return std::nullopt;
     }
     auto mask_dtype = mask_param->get_output_element_type(0);
+
+    // Explicit attention scale, present only in the fused form (see create_hfa_tile_model).
+    std::shared_ptr<ov::op::v0::Constant> q_scale;
+    if (auto scale_out = pattern_nodes.scale_source(); scale_out.get_node_shared_ptr()) {
+        q_scale = ov::as_type_ptr<ov::op::v0::Constant>(scale_out.get_node_shared_ptr());
+        if (!q_scale) {
+            LOG_WARN("Attention scale is not a Constant - cannot fold it into the HFA tile model");
+            return std::nullopt;
+        }
+        LOG_DEBUG("Found explicit attention scale: " << q_scale->cast_vector<float>().front());
+    }
 
     auto output_dtype = ov::element::f16;  // Default fallback
     if (model->outputs().size() > 0) {
@@ -1050,16 +1195,96 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     // V tensors are pre-transposed (stored as [B,H,head_dim,seq]) only when OptimizeValueTensors
     // succeeded, which is reflected by the V-concat axis being 3 instead of the default 2.
     const bool v_transposed = (v_seq_dim == 3);
-    LOG_INFO("Creating HFA tile models with tile_size=" << query_size << ", v_transposed=" << v_transposed);
+
+    // Tile size. Historically this was just query_size (Q's axis-2 length). That is right only when
+    // axis 2 carries the plain chunk length, which fails as soon as the producer folds each GQA
+    // group's query heads into the query-sequence axis: axis 2 then holds G*q_len, so e.g.
+    // 16512 % 2048 != 0 and context_size/query_size silently truncates the tile grid to 8 tiles
+    // covering 16384 of 16512 positions.
+    //
+    // The runtime already tells us what the tile size has to be: the final tile must consume the
+    // whole present KV slice in one inference (attn_subgraph.cpp asserts final_tile_length ==
+    // tile_size), and every past block must be a whole number of tiles. So take it from the KV
+    // Concat's last input -- the current-step K -- and check the rest lines up. For an unfolded
+    // graph the present slice *is* query_size, so this reproduces the historical value exactly.
+    const std::size_t num_k_inputs = k_concat->get_input_size();
+    std::size_t tile_size = 0;
+    if (num_k_inputs >= 2 && k_concat->get_input_partial_shape(num_k_inputs - 1).is_static()) {
+        tile_size = k_concat->get_input_shape(num_k_inputs - 1)[k_seq_dim];
+    }
+    if (tile_size == 0 || context_size % tile_size != 0) {
+        LOG_WARN("Unusable HFA tile size " << tile_size << ": it must be non-zero and divide context_size "
+                                           << context_size);
+        return std::nullopt;
+    }
+    // Every past block is walked in whole tiles by the runtime loop.
+    for (std::size_t i = 0; i + 1 < num_k_inputs; ++i) {
+        if (!k_concat->get_input_partial_shape(i).is_static() ||
+            k_concat->get_input_shape(i)[k_seq_dim] % tile_size != 0) {
+            LOG_WARN("Past KV block " << i << " is not a whole number of " << tile_size << "-position tiles");
+            return std::nullopt;
+        }
+    }
+    LOG_INFO("Creating HFA tile models with tile_size=" << tile_size << " (query_size=" << query_size
+                                                        << ", context_size=" << context_size << ", "
+                                                        << context_size / tile_size
+                                                        << " tiles max), v_transposed=" << v_transposed);
+
+    // ========================================================================
+    // Step 5a: Make the final tile model produce the shape the block's Result has
+    // ========================================================================
+    // create_final_tile_outputs' hardcoded Transpose->Reshape yields [B, S, H*D]. That is right for
+    // a GenAI-shaped block and wrong for a LiteRT one, where the block ends one op earlier (see
+    // collect_post_attention_chain). Getting it wrong is not caught until the first inference, so
+    // decide it here: reproduce the block's own chain when the shapes disagree, and refuse to build
+    // the block at all if the chain cannot be reproduced.
+    std::vector<std::shared_ptr<ov::Node>> post_attn_chain;
+    {
+        const auto attn_out =
+            pattern_nodes.is_fused() ? pattern_nodes.fused_sdpa_node : pattern_nodes.matmul2_node;
+        const ov::Shape tile_out_layout{q_shape_static[0], q_shape_static[1], query_size, q_shape_static[3]};
+        const ov::Shape default_out_shape{q_shape_static[0], query_size, q_shape_static[1] * q_shape_static[3]};
+
+        const auto chain = collect_post_attention_chain(attn_out);
+        ov::Shape block_out_shape;
+        bool block_out_known = false;
+        if (chain.found_result) {
+            block_out_shape = chain.result_shape;
+            block_out_known = true;
+        } else if (model->outputs().size() == 1 && model->output(0).get_partial_shape().is_static()) {
+            block_out_shape = model->output(0).get_shape();
+            block_out_known = true;
+        }
+
+        if (block_out_known && block_out_shape != default_out_shape) {
+            const bool reproducible = chain.found_result && !chain.nodes.empty() && attn_out &&
+                                      attn_out->get_output_partial_shape(0).is_static() &&
+                                      attn_out->get_output_shape(0) == tile_out_layout;
+            if (!reproducible) {
+                LOG_WARN("The attention block has to produce "
+                         << block_out_shape << " but HFA's final tile model produces " << default_out_shape
+                         << ", and the block's post-attention chain cannot be replayed - refusing to build a"
+                            " tile model whose Result does not match the block's");
+                return std::nullopt;
+            }
+            post_attn_chain = chain.nodes;
+            LOG_INFO("Attention block output is " << block_out_shape << ", not the default " << default_out_shape
+                                                  << " - replaying the block's own " << post_attn_chain.size()
+                                                  << "-node layout chain in the final tile model");
+        }
+    }
+
     auto tile_model = create_hfa_tile_model(q_shape_static,
                                             dtype,
                                             mask_dtype,
-                                            query_size,
+                                            static_cast<int64_t>(tile_size),
                                             kv_num_heads,
                                             false,
                                             fused_flash_attention,
                                             enable_mask_skipping,
-                                            v_transposed);
+                                            v_transposed,
+                                            ov::element::f16,
+                                            q_scale);
     if (!tile_model) {
         LOG_WARN("Failed to create HFA tile model");
         return std::nullopt;
@@ -1068,13 +1293,15 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     auto final_tile_model = create_hfa_tile_model(q_shape_static,
                                                   dtype,
                                                   mask_dtype,
-                                                  query_size,
+                                                  static_cast<int64_t>(tile_size),
                                                   kv_num_heads,
                                                   true,
                                                   fused_flash_attention,
                                                   enable_mask_skipping,
                                                   v_transposed,
-                                                  output_dtype);
+                                                  output_dtype,
+                                                  q_scale,
+                                                  post_attn_chain);
     if (!final_tile_model) {
         LOG_WARN("Failed to create HFA final tile model");
         return std::nullopt;
@@ -1088,7 +1315,7 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     hfa._final_tile_model = final_tile_model;
     hfa._query_size = query_size;
     hfa._context_size = context_size;
-    hfa._tile_size = query_size;
+    hfa._tile_size = tile_size;
     hfa._k_seq_dim = k_seq_dim;
     hfa._v_seq_dim = v_seq_dim;
 
@@ -1110,7 +1337,7 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     build_tile_output_mapping(hfa, tile_model);
 
     LOG_INFO("Successfully created HostFlashAttention with query_size="
-             << query_size << ", context_size=" << context_size << ", tile_size=" << query_size);
+             << query_size << ", context_size=" << context_size << ", tile_size=" << tile_size);
 
     return hfa;
 }
