@@ -1074,7 +1074,8 @@ static std::optional<std::size_t> extract_sequence_dim_from_concat(const std::sh
 
 std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr<ov::Model>& model,
                                                            bool fused_flash_attention,
-                                                           bool enable_mask_skipping) {
+                                                           bool enable_mask_skipping,
+                                                           std::size_t tile_size_hint) {
     LOG_INFO("Attempting to create HostFlashAttention"
              << (fused_flash_attention ? " with fused flash attention node" : ""));
     LOG_BLOCK();
@@ -1216,6 +1217,10 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     std::size_t tile_size = 0;
     if (num_k_inputs >= 2 && k_concat->get_input_partial_shape(num_k_inputs - 1).is_static()) {
         tile_size = k_concat->get_input_shape(num_k_inputs - 1)[k_seq_dim];
+    }
+    if (tile_size_hint != 0) {
+        LOG_INFO("Overriding HFA tile size " << tile_size << " with NPUW_ATTN_HFA_TILE_SIZE=" << tile_size_hint);
+        tile_size = tile_size_hint;
     }
     if (tile_size == 0 || context_size % tile_size != 0) {
         LOG_WARN("Unusable HFA tile size " << tile_size << ": it must be non-zero and divide context_size "

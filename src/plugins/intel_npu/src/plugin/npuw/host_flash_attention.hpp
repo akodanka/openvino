@@ -141,9 +141,12 @@ struct HostFlashAttention {
     // Creates a FlashAttention instance from an SDPA model
     // if fused_flash_attention is true, uses the FlashAttentionTile Op optimized on compiler side
     // if enable_mask_skipping is true, enables mask skipping optimization for regular tile
+    // tile_size_hint: 0 = derive the tile size from the KV Concat's present slice. A non-zero value
+    // overrides that; extraction fails if it does not divide the context and every past block.
     static std::optional<HostFlashAttention> from(const std::shared_ptr<ov::Model>& model,
                                                   bool fused_flash_attention = true,
-                                                  bool enable_mask_skipping = false);
+                                                  bool enable_mask_skipping = false,
+                                                  std::size_t tile_size_hint = 0u);
 };
 
 }  // namespace function
