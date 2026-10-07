@@ -20,6 +20,8 @@ inline constexpr NPUWProperty<Option> npuw_property{::intel_npu::NPUWOptionMeta<
 
 namespace ov::intel_npu::npuw {
 
+// Weightless import source. The provider may return a FileRegion to map only a sub-region of the file,
+// in which case per-constant weight offsets are resolved relative to the region start.
 inline constexpr ov::Property<ov::FileHandleProvider> weights_handle_provider{"NPUW_WEIGHTS_HANDLE_PROVIDER"};
 
 namespace llm {

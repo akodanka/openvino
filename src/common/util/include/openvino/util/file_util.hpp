@@ -9,6 +9,7 @@
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -30,6 +31,33 @@ inline const FileHandle invalid_handle = reinterpret_cast<void*>(static_cast<uin
 using FileHandle = int;
 inline constexpr FileHandle invalid_handle = -1;
 #endif
+
+// Same definition is mirrored in openvino/runtime/file_handle.hpp; the guard allows including both.
+#ifndef OPENVINO_FILE_REGION_DEFINED
+#    define OPENVINO_FILE_REGION_DEFINED
+/**
+ * @brief A sub-region [offset, offset + size) of the file referenced by a platform-specific file handle.
+ *
+ * The constructor is intentionally implicit so that callables returning a bare FileHandle remain
+ * valid FileHandleProvider implementations and denote the whole file.
+ * @ingroup ov_runtime_cpp_api
+ */
+struct FileRegion {
+    /// @brief Platform-specific file handle (int fd on Linux/Unix, HANDLE on Windows).
+    FileHandle handle;
+    /// @brief Offset in bytes from the beginning of the file where the region starts.
+    size_t offset;
+    /// @brief Size of the region in bytes. The default maps from offset to the end of the file.
+    size_t size;
+
+    constexpr FileRegion(FileHandle handle_,
+                         size_t offset_ = 0,
+                         size_t size_ = std::numeric_limits<size_t>::max()) noexcept
+        : handle(handle_),
+          offset(offset_),
+          size(size_) {}
+};
+#endif  // OPENVINO_FILE_REGION_DEFINED
 }  // namespace ov
 
 namespace ov::util {

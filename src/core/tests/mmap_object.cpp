@@ -224,6 +224,63 @@ TEST_P(RangedMappingTest, compare_id) {
     std::filesystem::remove(other_file_path);
 }
 
+TEST_P(RangedMappingTest, file_region_matches_handle_offset_size) {
+    const auto& [regions, use_file_path] = GetParam();
+    if (use_file_path) {
+        GTEST_SKIP() << "FileRegion overload is handle-based only";
+    }
+    const auto& [offset_1, size_1, offset_2, size_2, file_size] = regions;
+
+    const auto mm_1 = load_mmap_object(FileRegion{utils::open_ro_file(m_file_path), offset_1, size_1});
+    const auto mm_2 = load_mmap_object(FileRegion{utils::open_ro_file(m_file_path), offset_2, size_2});
+    const auto ref_1 = load_mmap_object(utils::open_ro_file(m_file_path), offset_1, size_1);
+    const auto ref_2 = load_mmap_object(utils::open_ro_file(m_file_path), offset_2, size_2);
+    ASSERT_NE(mm_1, nullptr);
+    ASSERT_NE(mm_2, nullptr);
+
+    EXPECT_EQ(mm_1->size(), m_sector_1.size());
+    EXPECT_EQ(mm_2->size(), m_sector_2.size());
+    EXPECT_EQ(m_sector_1, std::vector<char>(mm_1->data(), mm_1->data() + mm_1->size()));
+    EXPECT_EQ(m_sector_2, std::vector<char>(mm_2->data(), mm_2->data() + mm_2->size()));
+    EXPECT_EQ(mm_1->get_id(), ref_1->get_id());
+    EXPECT_EQ(mm_2->get_id(), ref_2->get_id());
+}
+
+TEST(FileRegion, implicit_from_handle_denotes_whole_file) {
+    constexpr FileRegion region = FileHandle{};
+    EXPECT_EQ(region.offset, 0u);
+    EXPECT_EQ(region.size, auto_size);
+}
+
+TEST(FileHandleProvider, accepts_legacy_callable_returning_bare_handle) {
+    std::filesystem::path file_path = utils::generateTestFilePrefix() + "_provider";
+    const char test_data[] = "Test data for FileHandleProvider";
+    {
+        std::ofstream os(file_path, std::ios::binary);
+        os.write(test_data, sizeof(test_data));
+    }
+    {
+        // A pre-FileRegion provider: returns the bare handle and expects the whole file to be mapped.
+        FileHandleProvider legacy_provider = [&]() -> FileHandle {
+            return utils::open_ro_file(file_path);
+        };
+        FileHandleProvider region_provider = [&]() {
+            return FileRegion{utils::open_ro_file(file_path), 5, 4};
+        };
+
+        const auto whole = load_mmap_object(legacy_provider());
+        ASSERT_NE(whole, nullptr);
+        EXPECT_EQ(whole->size(), sizeof(test_data));
+        EXPECT_EQ(std::string(whole->data(), whole->size() - 1), test_data);
+
+        const auto part = load_mmap_object(region_provider());
+        ASSERT_NE(part, nullptr);
+        EXPECT_EQ(part->size(), 4u);
+        EXPECT_EQ(std::string(part->data(), part->size()), "data");
+    }
+    std::filesystem::remove(file_path);
+}
+
 static const auto pg_sz = []() {
     const auto sz = util::get_system_page_size();
     return sz > 0 ? static_cast<size_t>(sz) : size_t{4096};

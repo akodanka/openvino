@@ -420,6 +420,74 @@ void expect_lazy_weightless_mmap_roundtrip(const ov::element::Type& type,
     expect_tensors_equal(var.eval(), evaluated);
 }
 
+// Same import path, but the weights are served through NPUW_WEIGHTS_HANDLE_PROVIDER and the "weights
+// pool" is embedded inside a larger file at `pool_file_offset`. The provider returns a FileRegion for that
+// window, so the constant's pool-relative `offset` must resolve against the region start - a provider
+// ignoring the region (whole-file mapping) would read the leading filler instead.
+void expect_lazy_weightless_region_provider_roundtrip(const ov::element::Type& type,
+                                                      const ov::Shape& shape,
+                                                      std::size_t pool_file_offset,
+                                                      std::size_t offset,
+                                                      std::size_t tail_size,
+                                                      const std::string& tag) {
+    using namespace ov::npuw::s11n;
+
+    const auto packed_size = ov::util::get_memory_size(type, ov::shape_size(shape));
+    ASSERT_GT(packed_size, 0u);
+    ASSERT_GT(pool_file_offset, 0u) << "test must use a non-zero region offset to be meaningful";
+
+    std::vector<uint8_t> payload(packed_size);
+    for (std::size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<uint8_t>(0xA5u + i);
+    }
+
+    auto constant = make_weightless_constant_from_bytes(type, shape, payload, offset);
+    ASSERT_EQ(constant->get_byte_size(), packed_size);
+
+    // Pool layout: `offset` filler + payload + `tail_size` filler.
+    std::vector<uint8_t> pool(offset, 0xCCu);
+    pool.insert(pool.end(), payload.begin(), payload.end());
+    pool.insert(pool.end(), tail_size, 0xDDu);
+    const auto pool_size = pool.size();
+
+    // File layout: `pool_file_offset` filler (different byte so a wrong base is detectable) + pool.
+    std::vector<uint8_t> file_bytes(pool_file_offset, 0xEEu);
+    file_bytes.insert(file_bytes.end(), pool.begin(), pool.end());
+
+    const ScopedFile weights_file = write_binary_file(tag, file_bytes);
+
+    // On POSIX the mapping takes ownership of the descriptor, so each call must hand out a fresh one.
+    ov::FileHandleProvider provider = [path = weights_file.path, pool_file_offset, pool_size]() {
+        return ov::FileRegion{ov::test::utils::open_ro_file(path), pool_file_offset, pool_size};
+    };
+
+    ov::npuw::weights::LazyTensor var(constant);
+    ov::npuw::weights::LazyTensor res;
+
+    std::stringstream ss;
+    write(ss, var);
+    read(ss, res);
+
+    {
+        auto mapped = ov::load_mmap_object(provider());
+        ASSERT_NE(mapped, nullptr);
+        ASSERT_EQ(mapped->size(), pool_size);
+        auto weights = std::make_shared<Weights>(reinterpret_cast<char*>(mapped->data()), mapped->size(), mapped);
+
+        // No weights_path: eval() must go through the provider.
+        WeightsContext import_ctx(weights, "", {}, {}, provider);
+        ASSERT_NO_THROW(res.read_weight(import_ctx));
+    }
+
+    ov::Tensor evaluated;
+    ASSERT_NO_THROW(evaluated = res.eval());
+    EXPECT_EQ(evaluated.get_element_type(), type);
+    EXPECT_EQ(evaluated.get_shape(), shape);
+    ASSERT_EQ(evaluated.get_byte_size(), packed_size);
+    EXPECT_EQ(std::memcmp(static_cast<const ov::Tensor&>(evaluated).data(), payload.data(), packed_size), 0);
+    expect_tensors_equal(var.eval(), evaluated);
+}
+
 // Same import path, but the weight description is malformed (by default: it does not fit the
 // weights file). read_weight() must reject the blob instead of handing out an OOB view.
 void expect_lazy_weightless_mmap_rejected(
@@ -2546,6 +2614,20 @@ TEST(SerializationTest, OVTypes_LazyTensor_weightless_mmap_f32_roundtrip) {
 // offset + byte_size == weights size must still be accepted - the guard is inclusive on purpose.
 TEST(SerializationTest, OVTypes_LazyTensor_weightless_mmap_exact_fit_roundtrip) {
     expect_lazy_weightless_mmap_roundtrip(ov::element::u4, ov::Shape{2, 8}, 8, 0, "u4_exact");
+}
+
+// Provider returns a FileRegion: the pool sits at a non-zero, page-unaligned file offset.
+TEST(SerializationTest, OVTypes_LazyTensor_weightless_region_provider_f32_roundtrip) {
+    expect_lazy_weightless_region_provider_roundtrip(ov::element::f32, ov::Shape{2, 2}, 4097, 8, 8, "region_f32");
+}
+
+TEST(SerializationTest, OVTypes_LazyTensor_weightless_region_provider_u4_roundtrip) {
+    expect_lazy_weightless_region_provider_roundtrip(ov::element::u4, ov::Shape{2, 8}, 777, 8, 16, "region_u4");
+}
+
+// Pool exactly at the region end: the region size (not the file size) must bound the weight.
+TEST(SerializationTest, OVTypes_LazyTensor_weightless_region_provider_exact_fit_roundtrip) {
+    expect_lazy_weightless_region_provider_roundtrip(ov::element::u8, ov::Shape{16}, 100, 0, 0, "region_exact");
 }
 
 TEST(SerializationTest, OVTypes_LazyTensor_weightless_mmap_offset_oob) {

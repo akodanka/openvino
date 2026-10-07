@@ -130,6 +130,12 @@ ov::npuw::s11n::WeightsContext make_import_weights_ctx(const ov::AnyMap& propert
             handle_it != properties.end()) {
             if (handle_it->second.is<ov::FileHandleProvider>()) {
                 handle_provider = handle_it->second.as<ov::FileHandleProvider>();
+            } else if (handle_it->second.is<std::function<ov::FileHandle()>>()) {
+                // Legacy provider type (bare handle, whole file): adapt to the FileRegion-returning form.
+                auto legacy = handle_it->second.as<std::function<ov::FileHandle()>>();
+                handle_provider = [legacy = std::move(legacy)]() -> ov::FileRegion {
+                    return legacy();
+                };
             } else {
                 LOG_WARN("WEIGHTS_HANDLE_PROVIDER property is present but is not a FileHandleProvider; falling back to "
                          "other weightless import sources");
@@ -170,8 +176,7 @@ ov::npuw::s11n::WeightsContext make_import_weights_ctx(const ov::AnyMap& propert
     if (is_weightless) {
         std::shared_ptr<ov::MappedMemory> mapped_memory;
         if (handle_provider) {
-            ov::FileHandle handle = handle_provider();
-            mapped_memory = ov::load_mmap_object(handle);
+            mapped_memory = ov::load_mmap_object(handle_provider());
         } else if (!weights_path.empty()) {
             mapped_memory = ov::load_mmap_object(ov::util::make_path(weights_path));
         }
